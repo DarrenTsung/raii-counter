@@ -1,11 +1,40 @@
+//! # raii-counter
+//! Rust type for a RAII Counter (counts number of held instances,
+//! decrements count on `Drop`), implemented with `Arc<AtomicUsize>`.
+//!
+//! Useful for tracking the number of holders exist for a handle,
+//! tracking the number of transactions that are in-flight, etc.
+//!
+//! ## Demo
+//!
+//! ```rust
+//! extern crate raii_counter;
+//! use raii_counter::Counter;
+//!
+//! let counter = Counter::new();
+//! assert_eq!(counter.count(), 1);
+//!
+//! let weak = counter.downgrade();
+//! assert_eq!(weak.count(), 0);
+//!
+//! {
+//!     let _counter1 = weak.spawn_upgrade();
+//!     assert_eq!(weak.count(), 1);
+//!     let _counter2 = weak.spawn_upgrade();
+//!     assert_eq!(weak.count(), 2);
+//! }
+//!
+//! assert_eq!(weak.count(), 0);
+//! ```
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-/// This is essentially an AtomicUsize that is clonable and whose count is based
-/// on the number of copies. The count is automaticaly updated on drop.
+/// Essentially an AtomicUsize that is clonable and whose count is based
+/// on the number of copies. The count is automatically updated on Drop.
 pub struct Counter(Arc<AtomicUsize>);
 
-/// This is a 'weak' reference to the Counter, so it will not affect the count
+/// A 'weak' Counter that does not affect the count.
 #[derive(Clone)]
 pub struct WeakCounter(Arc<AtomicUsize>);
 
@@ -14,6 +43,8 @@ impl Counter {
         Counter(Arc::new(AtomicUsize::new(1)))
     }
 
+    /// Consume self (causing the count to decrease by 1)
+    /// and return a weak reference to the count through a WeakCounter
     pub fn downgrade(self) -> WeakCounter {
         WeakCounter(self.0.clone())
     }
@@ -40,6 +71,10 @@ impl Drop for Counter {
 }
 
 impl WeakCounter {
+    pub fn new() -> WeakCounter {
+        WeakCounter(Arc::new(AtomicUsize::new(0)))
+    }
+
     /// This method is inherently racey. Assume the count will have changed once
     /// the value is observed.
     #[inline]
