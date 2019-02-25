@@ -27,18 +27,20 @@
 //! assert_eq!(weak.count(), 0);
 //! ```
 
-use std::sync::Arc;
+use std::fmt::{self, Display, Formatter};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 /// Essentially an AtomicUsize that is clonable and whose count is based
 /// on the number of copies. The count is automatically updated on Drop.
+#[derive(Debug)]
 pub struct Counter {
     counter: Arc<AtomicUsize>,
     size: usize,
 }
 
 /// A 'weak' Counter that does not affect the count.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct WeakCounter(Arc<AtomicUsize>);
 
 impl Counter {
@@ -71,6 +73,12 @@ impl Clone for Counter {
     fn clone(&self) -> Self {
         self.counter.fetch_add(self.size, Ordering::AcqRel);
         Counter { counter: self.counter.clone(), size: self.size }
+    }
+}
+
+impl Display for Counter {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        write!(f, "{}", self.count())
     }
 }
 
@@ -107,6 +115,12 @@ impl WeakCounter {
     pub fn spawn_upgrade_with_size(&self, size: usize) -> Counter {
         self.0.fetch_add(size, Ordering::AcqRel);
         Counter { counter: self.0.clone(), size }
+    }
+}
+
+impl Display for WeakCounter {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        write!(f, "{}", self.count())
     }
 }
 
