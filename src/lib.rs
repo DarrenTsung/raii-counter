@@ -72,13 +72,16 @@ impl Counter {
 impl Clone for Counter {
     fn clone(&self) -> Self {
         self.counter.fetch_add(self.size, Ordering::AcqRel);
-        Counter { counter: self.counter.clone(), size: self.size }
+        Counter {
+            counter: self.counter.clone(),
+            size: self.size,
+        }
     }
 }
 
 impl Display for Counter {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
-        write!(f, "{}", self.count())
+        write!(f, "Counter(count={})", self.count())
     }
 }
 
@@ -114,13 +117,16 @@ impl WeakCounter {
     /// Instead of clone + upgrade, this will only clone once
     pub fn spawn_upgrade_with_size(&self, size: usize) -> Counter {
         self.0.fetch_add(size, Ordering::AcqRel);
-        Counter { counter: self.0.clone(), size }
+        Counter {
+            counter: self.0.clone(),
+            size,
+        }
     }
 }
 
 impl Display for WeakCounter {
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
-        write!(f, "{}", self.count())
+        write!(f, "WeakCounter(count={})", self.count())
     }
 }
 
