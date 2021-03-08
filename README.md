@@ -1,7 +1,14 @@
 # raii-counter
-Rust type for a RAII Counter (counts number of held instances, decrements count on `Drop`), implemented with `Arc<AtomicUsize>`.
 
-Useful for tracking the number of holders exist for a handle, tracking the number of transactions that are in-flight, etc.
+Rust type for a RAII Counter (counts number of held instances,
+decrements count on `Drop`), implemented with `Arc<AtomicUsize>`.
+
+Useful for tracking the number of holders exist for a handle,
+tracking the number of transactions that are in-flight, etc.
+
+## Additional Features
+* Counters can have a size, eg. a Counter with `size` 4 adds 4
+to the count, and removes 4 when dropped.
 
 ## Demo
 
@@ -24,3 +31,5 @@ assert_eq!(weak.count(), 0);
 
 assert_eq!(weak.count(), 0);
 ```
+
+License: MIT
