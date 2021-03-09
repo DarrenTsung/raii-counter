@@ -7,6 +7,10 @@
 //! # Additional Features
 //! * [`Counter`]s can have a size, eg. a [`Counter`] with `size` 4 adds 4
 //! to the count, and removes 4 when dropped.
+//! * [`NotifyHandle`]s can be used for efficient conditional checking, eg.
+//! if you want to wait until there are no in-flight transactions, see:
+//! [`CounterBuilder::create_notify`] / [`WeakCounterBuilder::create_notify`]
+//! and [`NotifyHandle::wait_until_condition`].
 //!
 //! # Demo
 //!
@@ -30,9 +34,14 @@
 //! assert_eq!(weak.count(), 0);
 //! ```
 
+use notify::NotifySender;
 use std::fmt::{self, Display, Formatter};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+
+mod notify;
+
+pub use notify::NotifyHandle;
 
 /// Essentially an AtomicUsize that is clonable and whose count is based
 /// on the number of copies (and their size). The count is automatically updated on Drop.
@@ -42,6 +51,7 @@ use std::sync::Arc;
 #[derive(Debug)]
 pub struct Counter {
     counter: Arc<AtomicUsize>,
+    notify: Vec<NotifySender>,
     size: usize,
 }
 
@@ -49,11 +59,14 @@ pub struct Counter {
 #[derive(Clone, Debug)]
 pub struct WeakCounter {
     counter: Arc<AtomicUsize>,
+    notify: Vec<NotifySender>,
 }
 
 /// A builder for the [`Counter`].
 pub struct CounterBuilder {
+    counter: Arc<AtomicUsize>,
     size: usize,
+    notify: Vec<NotifySender>,
 }
 
 impl CounterBuilder {
@@ -65,10 +78,23 @@ impl CounterBuilder {
         self
     }
 
+    /// Create a [`NotifyHandle`] with a link to the count of this object. This [`NotifyHandle`] will
+    /// be notified when the value of this count changes.
+    ///
+    /// [`NotifyHandle`]s cannot be associated after creation, since all linked
+    /// [`Counter`] / [`WeakCounter`]s cannot be accounted for.
+    pub fn create_notify(&mut self) -> NotifyHandle {
+        let (handle, sender) = NotifyHandle::new(Arc::clone(&self.counter));
+        self.notify.push(sender);
+        handle
+    }
+
     /// Create a new [`Counter`].
     pub fn build(self) -> Counter {
+        self.counter.fetch_add(self.size, Ordering::SeqCst);
         Counter {
-            counter: Arc::new(AtomicUsize::new(self.size)),
+            counter: self.counter,
+            notify: self.notify,
             size: self.size,
         }
     }
@@ -76,7 +102,11 @@ impl CounterBuilder {
 
 impl Default for CounterBuilder {
     fn default() -> Self {
-        Self { size: 1 }
+        Self {
+            counter: Arc::new(AtomicUsize::new(0)),
+            size: 1,
+            notify: vec![],
+        }
     }
 }
 
@@ -95,6 +125,7 @@ impl Counter {
     /// Create a new [`WeakCounter`] without consuming self.
     pub fn spawn_downgrade(&self) -> WeakCounter {
         WeakCounter {
+            notify: self.notify.clone(),
             counter: Arc::clone(&self.counter),
         }
     }
@@ -109,9 +140,13 @@ impl Counter {
 
 impl Clone for Counter {
     fn clone(&self) -> Self {
-        self.counter.fetch_add(self.size, Ordering::AcqRel);
+        self.counter.fetch_add(self.size, Ordering::SeqCst);
+        for sender in &self.notify {
+            sender.notify();
+        }
         Counter {
-            counter: self.counter.clone(),
+            notify: self.notify.clone(),
+            counter: Arc::clone(&self.counter),
             size: self.size,
         }
     }
@@ -125,26 +160,47 @@ impl Display for Counter {
 
 impl Drop for Counter {
     fn drop(&mut self) {
-        self.counter.fetch_sub(self.size, Ordering::AcqRel);
+        self.counter.fetch_sub(self.size, Ordering::SeqCst);
+        for sender in &self.notify {
+            sender.notify();
+        }
     }
 }
 
 /// A builder for the [`WeakCounter`].
-pub struct WeakCounterBuilder {}
+pub struct WeakCounterBuilder {
+    counter: Arc<AtomicUsize>,
+    notify: Vec<NotifySender>,
+}
 
 impl WeakCounterBuilder {
+    /// Create a [`NotifyHandle`] with a link to the count of this object. This [`NotifyHandle`] will
+    /// be notified when the value of this count changes.
+    ///
+    /// [`NotifyHandle`]s cannot be associated after creation, since all linked
+    /// [`Counter`] / [`WeakCounter`]s cannot be accounted for.
+    pub fn create_notify(&mut self) -> NotifyHandle {
+        let (handle, sender) = NotifyHandle::new(Arc::clone(&self.counter));
+        self.notify.push(sender);
+        handle
+    }
+
     /// Create a new [`WeakCounter`]. This [`WeakCounter`] creates a new count
     /// with value: 0 since the [`WeakCounter`] has no effect on the count.
     pub fn build(self) -> WeakCounter {
         WeakCounter {
-            counter: Arc::new(AtomicUsize::new(0)),
+            notify: self.notify,
+            counter: self.counter,
         }
     }
 }
 
 impl Default for WeakCounterBuilder {
     fn default() -> Self {
-        Self {}
+        Self {
+            counter: Arc::new(AtomicUsize::new(0)),
+            notify: vec![],
+        }
     }
 }
 
@@ -175,8 +231,12 @@ impl WeakCounter {
     /// Creates a new [`Counter`] with specified size without consuming the
     /// current [`WeakCounter`].
     pub fn spawn_upgrade_with_size(&self, size: usize) -> Counter {
-        self.counter.fetch_add(size, Ordering::AcqRel);
+        self.counter.fetch_add(size, Ordering::SeqCst);
+        for sender in &self.notify {
+            sender.notify();
+        }
         Counter {
+            notify: self.notify.clone(),
             counter: Arc::clone(&self.counter),
             size,
         }
@@ -192,6 +252,8 @@ impl Display for WeakCounter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::thread;
+    use std::time::Duration;
 
     #[test]
     fn it_works() {
@@ -238,5 +300,83 @@ mod tests {
         assert_eq!(weak.count(), 4);
         drop(counter);
         assert_eq!(weak.count(), 0);
+    }
+
+    #[test]
+    fn notify_works() {
+        let (weak, notify) = {
+            let mut builder = WeakCounter::builder();
+            let notify = builder.create_notify();
+            (builder.build(), notify)
+        };
+
+        let join_handle = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(100));
+            let mut counters = vec![];
+            for _ in 0..10 {
+                counters.push(weak.spawn_upgrade());
+            }
+
+            // Return counters from the thread so they
+            // never get dropped (at least until the thread
+            // gets joined).
+            counters
+        });
+
+        notify.wait_until_condition(|v| v == 10).unwrap();
+        join_handle.join().unwrap();
+    }
+
+    /// Run this test to gain more confidence that the notify is not flakey due to
+    /// race-conditions.
+    ///
+    /// ```
+    /// cargo test --release -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore]
+    fn test_notify_always_occurs() {
+        let mut i = 0;
+        loop {
+            notify_works();
+            println!("[{}] Completed.", i);
+            i += 1;
+        }
+    }
+
+    #[test]
+    fn notify_errors_when_all_references_are_dropped() {
+        let (weak, notify) = {
+            let mut builder = WeakCounter::builder();
+            let notify = builder.create_notify();
+            (builder.build(), notify)
+        };
+
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(100));
+            let mut counters = vec![];
+            for _ in 0..5 {
+                counters.push(weak.spawn_upgrade());
+            }
+            // All references are dropped here, therefore the condition
+            // will never be true.
+        });
+
+        assert!(notify.wait_until_condition(|v| v == 10).is_err());
+    }
+
+    #[test]
+    fn notify_checks_condition_before_erroring() {
+        let (weak, notify) = {
+            let mut builder = WeakCounter::builder();
+            let notify = builder.create_notify();
+            (builder.build(), notify)
+        };
+
+        // All counter references are dropped.
+        drop(weak);
+
+        // Shouldn't error since the condition is true.
+        assert!(notify.wait_until_condition(|v| v == 0).is_ok());
     }
 }
