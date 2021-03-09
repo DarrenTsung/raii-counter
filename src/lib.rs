@@ -303,7 +303,20 @@ mod tests {
     }
 
     #[test]
-    fn notify_works() {
+    fn wait_until_condition_works() {
+        run_wait_until_condition_test(|notify| notify.wait_until_condition(|v| v == 10).unwrap());
+    }
+
+    #[test]
+    fn wait_until_condition_with_timeout_works() {
+        run_wait_until_condition_test(|notify| {
+            notify
+                .wait_until_condition_timeout(|v| v == 10, Duration::from_secs(2))
+                .unwrap()
+        });
+    }
+
+    fn run_wait_until_condition_test(notify_fn: impl Fn(NotifyHandle)) {
         let (weak, notify) = {
             let mut builder = WeakCounter::builder();
             let notify = builder.create_notify();
@@ -323,7 +336,7 @@ mod tests {
             counters
         });
 
-        notify.wait_until_condition(|v| v == 10).unwrap();
+        notify_fn(notify);
         join_handle.join().unwrap();
     }
 
@@ -335,10 +348,10 @@ mod tests {
     /// ```
     #[test]
     #[ignore]
-    fn test_notify_always_occurs() {
+    fn test_wait_until_condition_always_occurs() {
         let mut i = 0;
         loop {
-            notify_works();
+            wait_until_condition_works();
             println!("[{}] Completed.", i);
             i += 1;
         }
@@ -384,7 +397,7 @@ mod tests {
     }
 
     #[test]
-    fn notify_with_timeout_works() {
+    fn notify_with_timeout_can_timeout() {
         let (weak, notify) = {
             let mut builder = WeakCounter::builder();
             let notify = builder.create_notify();

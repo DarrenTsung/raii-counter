@@ -62,12 +62,9 @@ impl NotifyHandle {
         &self,
         condition: impl Fn(usize) -> bool,
     ) -> Result<(), NotifyError> {
-        self.wait_until_condition_inner(condition, None)
+        self.wait_until_condition_inner(condition, |_| self.receiver.recv())
             .map_err(|e| match e {
-                NotifyTimeoutError::Disconnected => NotifyError::Disconnected,
-                NotifyTimeoutError::Timeout => {
-                    panic!("Timeout error from wait_until_condition without timeout!")
-                }
+                mpsc::RecvError => NotifyError::Disconnected,
             })
     }
 
@@ -77,14 +74,29 @@ impl NotifyHandle {
         condition: impl Fn(usize) -> bool,
         timeout: Duration,
     ) -> Result<(), NotifyTimeoutError> {
-        self.wait_until_condition_inner(condition, Some(timeout))
+        self.wait_until_condition_inner(condition, |elapsed| {
+            let remaining_time = if let Some(remaining_time) = timeout.checked_sub(elapsed) {
+                remaining_time
+            } else {
+                return Err(mpsc::RecvTimeoutError::Timeout);
+            };
+
+            self.receiver.recv_timeout(remaining_time)
+        })
+        .map_err(|e| match e {
+            mpsc::RecvTimeoutError::Disconnected => NotifyTimeoutError::Disconnected,
+            mpsc::RecvTimeoutError::Timeout => NotifyTimeoutError::Timeout,
+        })
     }
 
-    fn wait_until_condition_inner(
+    fn wait_until_condition_inner<E>(
         &self,
         condition: impl Fn(usize) -> bool,
-        timeout: Option<Duration>,
-    ) -> Result<(), NotifyTimeoutError> {
+        recv_with_elapsed: impl Fn(Duration) -> Result<(), E>,
+    ) -> Result<(), E>
+    where
+        E: FromDisconnected,
+    {
         let start = Instant::now();
 
         // Drain all messages in the channel before turning sends on again.
@@ -114,26 +126,9 @@ impl NotifyHandle {
                                 break Ok(());
                             }
 
-                            if let Some(timeout) = timeout {
-                                let remaining_time = if let Some(remaining_time) =
-                                    start.elapsed().checked_sub(timeout)
-                                {
-                                    remaining_time
-                                } else {
-                                    break Err(mpsc::RecvTimeoutError::Timeout);
-                                };
-
-                                break self.receiver.recv_timeout(remaining_time);
-                            } else {
-                                break self
-                                    .receiver
-                                    .recv()
-                                    .map_err(|_| mpsc::RecvTimeoutError::Disconnected);
-                            }
+                            break recv_with_elapsed(start.elapsed());
                         }
-                        Err(mpsc::TryRecvError::Disconnected) => {
-                            break Err(mpsc::RecvTimeoutError::Disconnected)
-                        }
+                        Err(mpsc::TryRecvError::Disconnected) => break Err(E::from_disconnected()),
                     }
                 }
             };
@@ -142,19 +137,34 @@ impl NotifyHandle {
             // will never change again.
             if let Err(err) = recv_result {
                 // We should check if the condition is satisfied one last time, then
-                // return Disconnected if still unsatisfied, since the condition will
-                // never be met.
+                // return the error if still unsatisfied. It's possible that the
+                // condition has been met even after an error case, eg. all counters
+                // are dropped.
                 return_if_condition!();
 
                 self.should_send.store(false, Ordering::SeqCst);
-                return Err(match err {
-                    mpsc::RecvTimeoutError::Disconnected => NotifyTimeoutError::Disconnected,
-                    mpsc::RecvTimeoutError::Timeout => NotifyTimeoutError::Timeout,
-                });
+                return Err(err);
             }
 
             return_if_condition!();
         }
+    }
+}
+
+/// Helper trait for abstracting over `recv()` and `recv_timeout()`.
+trait FromDisconnected {
+    fn from_disconnected() -> Self;
+}
+
+impl FromDisconnected for mpsc::RecvError {
+    fn from_disconnected() -> Self {
+        mpsc::RecvError
+    }
+}
+
+impl FromDisconnected for mpsc::RecvTimeoutError {
+    fn from_disconnected() -> Self {
+        mpsc::RecvTimeoutError::Disconnected
     }
 }
 
