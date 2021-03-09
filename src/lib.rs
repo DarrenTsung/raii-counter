@@ -41,7 +41,7 @@ use std::sync::Arc;
 
 mod notify;
 
-pub use notify::NotifyHandle;
+pub use notify::{NotifyError, NotifyHandle, NotifyTimeoutError};
 
 /// Essentially an AtomicUsize that is clonable and whose count is based
 /// on the number of copies (and their size). The count is automatically updated on Drop.
@@ -362,7 +362,10 @@ mod tests {
             // will never be true.
         });
 
-        assert!(notify.wait_until_condition(|v| v == 10).is_err());
+        assert_eq!(
+            notify.wait_until_condition(|v| v == 10),
+            Err(NotifyError::Disconnected),
+        );
     }
 
     #[test]
@@ -378,5 +381,22 @@ mod tests {
 
         // Shouldn't error since the condition is true.
         assert!(notify.wait_until_condition(|v| v == 0).is_ok());
+    }
+
+    #[test]
+    fn notify_with_timeout_works() {
+        let (weak, notify) = {
+            let mut builder = WeakCounter::builder();
+            let notify = builder.create_notify();
+            (builder.build(), notify)
+        };
+
+        assert_eq!(
+            notify.wait_until_condition_timeout(|v| v == 10, Duration::from_millis(100)),
+            Err(NotifyTimeoutError::Timeout)
+        );
+
+        // Counters are not dropped until here.
+        drop(weak);
     }
 }

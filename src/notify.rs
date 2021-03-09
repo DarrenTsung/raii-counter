@@ -1,6 +1,7 @@
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use thiserror::Error;
 
 /// Struct that enables functionality like waiting to be notified
@@ -12,10 +13,18 @@ pub struct NotifyHandle {
     counter: Arc<AtomicUsize>,
 }
 
-#[derive(Error, Debug)]
+#[derive(Error, Debug, PartialEq, Clone, Copy)]
 pub enum NotifyError {
     #[error("All linked senders are disconnected, therefore count will never change!")]
     Disconnected,
+}
+
+#[derive(Error, Debug, PartialEq, Clone, Copy)]
+pub enum NotifyTimeoutError {
+    #[error("All linked senders are disconnected, therefore count will never change!")]
+    Disconnected,
+    #[error("Timed out before condition was reached!")]
+    Timeout,
 }
 
 /// Struct that can send signals to the [`NotifyHandle`].
@@ -53,6 +62,31 @@ impl NotifyHandle {
         &self,
         condition: impl Fn(usize) -> bool,
     ) -> Result<(), NotifyError> {
+        self.wait_until_condition_inner(condition, None)
+            .map_err(|e| match e {
+                NotifyTimeoutError::Disconnected => NotifyError::Disconnected,
+                NotifyTimeoutError::Timeout => {
+                    panic!("Timeout error from wait_until_condition without timeout!")
+                }
+            })
+    }
+
+    /// [`NotifyHandle::wait_until_condition`] with a timeout.
+    pub fn wait_until_condition_timeout(
+        &self,
+        condition: impl Fn(usize) -> bool,
+        timeout: Duration,
+    ) -> Result<(), NotifyTimeoutError> {
+        self.wait_until_condition_inner(condition, Some(timeout))
+    }
+
+    fn wait_until_condition_inner(
+        &self,
+        condition: impl Fn(usize) -> bool,
+        timeout: Option<Duration>,
+    ) -> Result<(), NotifyTimeoutError> {
+        let start = Instant::now();
+
         // Drain all messages in the channel before turning sends on again.
         while let Ok(()) = self.receiver.try_recv() {}
         self.should_send.store(true, Ordering::SeqCst);
@@ -78,25 +112,45 @@ impl NotifyHandle {
                         Err(mpsc::TryRecvError::Empty) => {
                             if received_at_least_once {
                                 break Ok(());
+                            }
+
+                            if let Some(timeout) = timeout {
+                                let remaining_time = if let Some(remaining_time) =
+                                    start.elapsed().checked_sub(timeout)
+                                {
+                                    remaining_time
+                                } else {
+                                    break Err(mpsc::RecvTimeoutError::Timeout);
+                                };
+
+                                break self.receiver.recv_timeout(remaining_time);
                             } else {
-                                break self.receiver.recv();
+                                break self
+                                    .receiver
+                                    .recv()
+                                    .map_err(|_| mpsc::RecvTimeoutError::Disconnected);
                             }
                         }
-                        Err(mpsc::TryRecvError::Disconnected) => break Err(mpsc::RecvError),
+                        Err(mpsc::TryRecvError::Disconnected) => {
+                            break Err(mpsc::RecvTimeoutError::Disconnected)
+                        }
                     }
                 }
             };
 
             // If the receiver thread is disconnected, then the counter
             // will never change again.
-            if recv_result.is_err() {
+            if let Err(err) = recv_result {
                 // We should check if the condition is satisfied one last time, then
                 // return Disconnected if still unsatisfied, since the condition will
                 // never be met.
                 return_if_condition!();
 
                 self.should_send.store(false, Ordering::SeqCst);
-                return Err(NotifyError::Disconnected);
+                return Err(match err {
+                    mpsc::RecvTimeoutError::Disconnected => NotifyTimeoutError::Disconnected,
+                    mpsc::RecvTimeoutError::Timeout => NotifyTimeoutError::Timeout,
+                });
             }
 
             return_if_condition!();
